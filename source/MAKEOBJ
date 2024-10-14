@@ -1,0 +1,41 @@
+### for MAKE Version 4.0  Copyright (c) 1987, 1996 Borland International ###
+
+#=== macro's ===
+C38 = cc38h -CPU=300HA -I=\work\H8-3048F\h8c\include $<
+ASM = A38H $<-CPU=300HA:24 #-DEBUG
+LNK = L38H -SUBCOMMAND=$&.sub #-DEBUG
+CNV = C38H $<
+#===============
+
+#=== roule's ===
+.c.obj:
+	$(C38)
+	@move $&.obj $:
+.mar.obj:
+	$(ASM) # > $&.tag
+.abs.mot:
+	$(CNV)
+#===============
+
+#--- link's ---
+DEBUGER = debuger\debuger.obj
+
+#--- final target ---
+all:		$(DEBUGER)
+
+#--- make .obj ---
+debuger\debuger.obj:	debuger\debuger.mar \
+			debuger\dmpmem.inc \
+			debuger\inimem.inc \
+			debuger\chnmem.inc \
+			debuger\disasm.inc \
+			debuger\dbgmod.inc \
+			debuger\dmpwch.inc \
+			debuger\dmpsiz.inc \
+			debuger\wchsiz.inc \
+			debuger\hlpmsg.inc \
+			debuger\wreset.inc \
+			debuger\chnmsz.inc \
+			debuger\usrfnc.inc
+
+

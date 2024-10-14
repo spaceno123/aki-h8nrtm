@@ -1,0 +1,1412 @@
+;
+;	Program	DEBUGER.MAR
+;	Date	1998/5/2 .. 1998/5/30
+;	Copyright (C) 1998-1999 by AKIYA
+;
+;--- up date ---
+; 1998/6/5  0.51 user function (dputc, dputc_hb)
+; 1998/6/6   :   rxd recive check (user function dputc_hb kill)
+; 1998/6/7   :   extern symbol change
+; 1998/6/27 0.52 TRAPA, extern kill, initilize memory
+; 1998/7/5  0.53 change memory, back space
+; 1998/7/12 0.54 change register, toupper, getche_hc2b_n & fscan modify, getval
+; 1998/8/15 0.55 dbg_getc, idle(get_rxd_buf_chk -> int_end)
+; 1998/8/30 0.56 dmp_wch
+; 1998/9/13 0.57 dmp_siz, wch_siz
+; 1998/9/19 0.58 ?(help),wch_siz modify
+; 1998/9/20 0.58a wch_siz modify bug fix
+; 1998/11/15 0.59 watch dog reset
+; 1998/12/6 0.60 change memory size
+; 1999/10/16 0.61 debugger work size valiable, user function
+; 2000/5/27 0.62 view list, view trace
+; 2000/6/21 0.62a dbg_getc, dbg_putc bug fix
+; 2000/9/28 0.62b DEBUG_SCI section DATA -> COMMON
+;
+
+	.include	"include\ioregs.h"
+
+	;::::::::::::
+	;::: work :::
+	;::::::::::::
+
+DBG_WRK_SIZE	.equ	256	; debugger work size
+RXD_BUF_SIZE	.equ	16	; must be 2^n
+TXD_BUF_SIZE	.equ	16	; must be 2^n
+
+	.section	DEBUG_RAM, DATA, ALIGN=2
+	.res.b	DBG_WRK_SIZE
+
+;dbg_wrk			; debugger work top
+
+	.section	DEBUG_t, DUMMY, ALIGN=2
+	.org	0
+
+x_usr_rg	.res.l	7	; user er0..er6
+x_usr_sp	.res.l	1	; user sp
+x_dbg_sp	.res.l	1	; debuger sp
+
+x_int_end	.res.l	1	; debugger interrupt end process
+
+x_rxd_buf	.res.b	RXD_BUF_SIZE	; must be 2^n
+x_rxd_act	.res.b	1
+x_rxd_wrp	.res.b	1
+
+x_txd_buf	.res.b	TXD_BUF_SIZE	; must be 2^n
+x_txd_act	.res.b	1
+x_txd_wrp	.res.b	1
+
+x_stp_wrk	.res.b	10+4	; step work 10 byte + call 4 byte
+x_brk_adr	.res.l	1	; program counter break address
+
+x_usr_fnc	.res.l	1	; user function address		;+ 99/10/16
+
+;dbg_stk	.res.b	DBG_WRK_SIZE-(dbg_stk-dbg_wrk)	; debugger stack
+;
+;dbg_wke			; debugger work end +1
+
+	;:::::::::::
+	;::: SCI :::
+	;:::::::::::
+
+;*	.section	DEBUG_SCI, DATA, ALIGN=2
+	.section	DEBUG_SCI, COMMON, ALIGN=2		;* 00/9/28
+
+SMRx	.res.b	1
+BRRx	.res.b	1
+SCRx	.res.b	1
+TDRx	.res.b	1
+SSRx	.res.b	1
+RDRx	.res.b	1
+
+	;::::::::::::
+	;::: CODE :::
+	;::::::::::::
+
+	.section	DEBUG_ROM, CODE, ALIGN=2
+
+	;/////////////////
+	;/// initilize ///
+	;/////////////////
+
+;- initialize debugger -
+; entry	 none.
+; return none.
+; break	 er0,er1
+; stack	 none.
+;- 	.export	init_debuger
+;- init_debuger:
+	.export	dbg_init
+dbg_init:
+	;* SCI pre initialize *
+	mov.b	#B'00000000,r0l	; TIE=0,RIE=0,TE=0,RE=0,MPIE=0,TEIE=0,CKE=00
+	mov.b	r0l,@SCRx:8
+	mov.b	#B'00000000,r0l	; C/A=0,CHR=0,PE=0,O/E=0,STOP=0,MP=0,CKS=00
+	mov.b	r0l,@SMRx:8
+	mov.b	#(16*1000000/(32*38400))-1,r0l ; clock=16MHz,n=0,B=38400bit/s
+	mov.b	r0l,@BRRx:8
+	;* debuger initialize (with wait SCI 1bit time) *
+;*	mov.l	#dbg_wke,er1
+	mov.l	#startof DEBUG_RAM + sizeof DEBUG_RAM,er1	;* 99/10/16
+;*	mov.w	#DBG_WRK_SIZE,e0
+	mov.w	#sizeof DEBUG_RAM,e0				;* 99/10/16
+	mov.b	#0,r0l
+dbg_init_0
+	mov.b	r0l,@-er1
+	dec.w	#1,e0
+	bne	dbg_init_0:8
+;*	mov.l	#dbg_wke,er1
+	mov.l	#startof DEBUG_RAM + sizeof DEBUG_RAM,er1	;* 99/10/16
+	mov.l	#debug_entry,er0
+	mov.l	er0,@-er1
+	sub.l	#4*7,er1		; 4*7 is save regs size
+;*	mov.l	er1,@dbg_sp
+	mov.l	er1,@startof DEBUG_RAM + x_dbg_sp		;* 99/10/16
+	mov.l	#int_end_dbg_jmp,er1
+	mov.l	@er1,er1
+;*	mov.l	er1,@int_end
+	mov.l	er1,@startof DEBUG_RAM + x_int_end		;* 99/10/16
+	;* SCI post initialize *
+	bclr	#6,@SSRx:8	; RDRF clear
+	bclr	#5,@SSRx:8	; ORER clear
+	bclr	#4,@SSRx:8	; FRE clear
+	bclr	#3,@SSRx:8	; PER clear
+	mov.b	#B'01110000,r0l	; TIE=0,RIE=1,TE=1,RE=1,MPIE=0,TEIE=0,CKE=00
+	mov.b	r0l,@SCRx:8
+	rts
+int_end_dbg_jmp:
+	jmp	@int_end_dbg
+int_end_lop_jmp:
+	jmp	@int_end_lop
+
+	;/////////////////
+	;/// interrupt ///
+	;/////////////////
+
+;- interrupt SCI error -
+; entry	 none.
+; return none.
+; break	 none.
+; stack	 (4)
+;- 	.export	int_err_dbg
+;- int_err_dbg:
+	.export	dbg_sci_err
+dbg_sci_err:
+	bclr	#6,@SSRx:8	; RDRF clear
+	bclr	#5,@SSRx:8	; ORER clear
+	bclr	#4,@SSRx:8	; FRE clear
+	bclr	#3,@SSRx:8	; PER clear
+	rte
+
+;- interrupt SCI recive -
+; entry	 none.
+; return none.
+; break	 none.
+; stack	 (4)
+;- 	.export	int_rxd_dbg
+;- int_rxd_dbg:
+	.export	dbg_sci_rxd
+dbg_sci_rxd:
+;*	mov.l	sp,@usr_sp	; sp=ccr,return
+	mov.l	sp,@startof DEBUG_RAM + x_usr_sp; sp=ccr,return	;* 99/10/16
+;*	mov.l	#usr_sp,sp
+	mov.l	#startof DEBUG_RAM + x_usr_sp,sp		;* 99/10/16
+	push	er6
+	mov.b	@RDRx:8,r6l
+	bclr	#6,@SSRx:8	; RDRF clear
+	push	er5
+	push	er4
+	push	er3
+	push	er2
+	push	er1
+	push	er0
+;*	mov.l	@dbg_sp,sp
+	mov.l	@startof DEBUG_RAM + x_dbg_sp,sp		;* 99/10/16
+	pop	er0
+	mov.b	r6l,r0l
+	pop	er1
+	pop	er2
+	pop	er3
+	pop	er4
+	pop	er5
+	pop	er6
+	orc	#B'00000001,ccr	; rxd interrupt signe !
+	rts
+
+;- interrupt SCI end ---
+; entry	 none.
+; return cary=1:recive interrupt(r0l=data),0:trunsmit interrupt
+; break	 r0l
+; stack	 (4)+28
+int_end_dbg:
+	push	er6
+	push	er5
+	push	er4
+	push	er3
+	push	er2
+	push	er1
+	push	er0
+;*	mov.l	sp,@dbg_sp
+	mov.l	sp,@startof DEBUG_RAM + x_dbg_sp		;* 99/10/16
+;*	mov.l	#usr_rg,sp
+	mov.l	#startof DEBUG_RAM + x_usr_rg,sp		;* 99/10/16
+	pop	er0
+	pop	er1
+	pop	er2
+	pop	er3
+	pop	er4
+	pop	er5
+	pop	er6
+;*	mov.l	@usr_sp,sp
+	mov.l	@startof DEBUG_RAM + x_usr_sp,sp		;* 99/10/16
+	rte
+
+;- interrupt SCI trunsmit -
+; entry	 none.
+; return none.
+; break	 none.
+; stack	 (4)
+;- 	.export	int_txd_dbg
+int_txd_dbg:
+	.export	dbg_sci_txd
+dbg_sci_txd:
+;*	mov.l	sp,@usr_sp	; sp=ccr,return
+	mov.l	sp,@startof DEBUG_RAM + x_usr_sp; sp=ccr,return	;* 99/10/16
+;*	mov.l	#usr_sp,sp
+	mov.l	#startof DEBUG_RAM + x_usr_sp,sp		;* 99/10/16
+	push	er6
+	push	er5
+	push	er4
+	push	er3
+	push	er2
+	push	er1
+	push	er0
+;*	mov.l	@dbg_sp,sp
+	mov.l	@startof DEBUG_RAM + x_dbg_sp,sp		;* 99/10/16
+	pop	er0
+	pop	er1
+	pop	er2
+	pop	er3
+	pop	er4
+	pop	er5
+	pop	er6
+	andc	#B'11111110,ccr	; txd interrupt signe !
+	rts
+
+;- interrupt SCI end loop ---
+; entry	 none.
+; return cary=1:recive interrupt(r0l=data),0:trunsmit interrupt
+; break	 r0l
+; stack	 (4)
+int_end_lop:
+	bld	#6,@SSRx:8	; RDRF check
+	bcc	int_end_lop_0:8
+	mov.b	@RDRx:8,r0l
+	bclr	#6,@SSRx:8	; RDRF clear
+	rts
+int_end_lop_0
+	bild	#7,@SSRx:8	; TDRE check
+	bcs	int_end_lop:8
+	rts
+
+;- interrupt SCI recive check ---
+; entry	 none.
+; return cary=1:recive interrupt(r0l=data),0:none.
+; break	 r0l
+; stack	 (4)
+int_rxd_chk:
+	bld	#6,@SSRx:8	; RDRF check
+	bcc	int_rxd_chk_0:8
+	mov.b	@RDRx:8,r0l
+	bclr	#6,@SSRx:8	; RDRF clear
+int_rxd_chk_0
+	rts
+
+;-	;/////////////////
+;-	;/// for debug ///
+;-	;/////////////////
+;-
+;-test_send:
+;-	bld	#7,@SSRx:8
+;-	bcc	test_send
+;-	mov.b	r0l,@TDRx:8
+;-	bclr	#7,@SSRx:8
+;-	rts
+;-
+;-test_send_str_msg:
+;-	mov.l	#debug_entry_msg,er1
+;-test_send_str:
+;-	mov.b	@er1+,r0l
+;-	beq	test_send_str_0:8
+;-	bsr	test_send
+;-	bra	test_send_str:8
+;-test_send_str_0
+;-	rts
+;-
+;-test_send_sp:
+;-	mov.b	#" ",r0l
+;-	bra	test_send
+;-
+;-test_send_crlf:
+;-	mov.b	#H'0d,r0l
+;-	bsr	test_send
+;-	mov.b	#H'0a,r0l
+;-	bra	test_send
+;-
+;-test_send_hb:
+;-	push.w	r0
+;-	shlr.b	r0l
+;-	shlr.b	r0l
+;-	shlr.b	r0l
+;-	shlr.b	r0l
+;-	bsr	test_send_hb_0:8
+;-	pop.w	r0
+;-	and.b	#H'f,r0l
+;-test_send_hb_0
+;-	cmp.b	#9,r0l
+;-	bls	test_send_hb_1:8
+;-	add.b	#"A"-"0"-10,r0l
+;-test_send_hb_1
+;-	add.b	#"0",r0l
+;-	bra	test_send
+;-
+;-test_send_hw:
+;-	xor.b	r0l,r0h
+;-	xor.b	r0h,r0l
+;-	xor.b	r0l,r0h
+;-	bsr	test_send_hb
+;-	xor.b	r0l,r0h
+;-	xor.b	r0h,r0l
+;-	xor.b	r0l,r0h
+;-	bra	test_send_hb
+;-
+;-test_send_hl:
+;-	xor.w	e0,r0
+;-	xor.w	r0,e0
+;-	xor.w	e0,r0
+;-	bsr	test_send_hw
+;-	xor.w	e0,r0
+;-	xor.w	r0,e0
+;-	xor.w	e0,r0
+;-	bra	test_send_hw
+;-
+;-test_send_md:	;<ent> er0=start, er1=end
+;-	push	er0
+;-	bsr	test_send_hl
+;-test_send_md_0
+;-	bsr	test_send_sp
+;-	mov.l	@sp,er0
+;-	mov.b	@er0,r0h
+;-	xor.b	r0l,r0h
+;-	xor.b	r0h,r0l
+;-	xor.b	r0l,r0h
+;-	bsr	test_send_hb
+;-	pop	er0
+;-	cmp.l	er1,er0
+;-	beq	test_send_md_1:8
+;-	inc.l	#1,er0
+;-	push	er0
+;-	and.b	#H'f,r0l
+;-	bne	test_send_md_0:8
+;-	bsr	test_send_crlf
+;-	pop	er0
+;-	bra	test_send_md:8
+;-test_send_md_1
+;-	bsr	test_send_crlf
+;-	rts
+
+	;//////////////
+	;/// buffer ///
+	;//////////////
+
+;- put rxd buffer -
+; entry	 r0l=data
+; return cary=1:ok,0:buffer full
+; break	 er1
+; stack	 (4)
+put_rxd_buf:
+;*	mov.b	@rxd_act,r1l
+	mov.b	@startof DEBUG_RAM + x_rxd_act,r1l		;* 99/10/16
+	cmp.b	#RXD_BUF_SIZE,r1l
+	bhs	put_rxd_buf_0:8
+	inc.b	r1l
+;*	mov.b	r1l,@rxd_act
+	mov.b	r1l,@startof DEBUG_RAM + x_rxd_act		;* 99/10/16
+	sub.l	er1,er1
+;*	mov.b	@rxd_wrp,r1l
+	mov.b	@startof DEBUG_RAM + x_rxd_wrp,r1l		;* 99/10/16
+;*	mov.b	r0l,@(rxd_buf,er1)
+	mov.b	r0l,@(startof DEBUG_RAM + x_rxd_buf,er1)	;* 99/10/16
+	inc.b	r1l
+	and.b	#RXD_BUF_SIZE-1,r1l
+;*	mov.b	r1l,@rxd_wrp
+	mov.b	r1l,@startof DEBUG_RAM + x_rxd_wrp		;* 99/10/16
+	orc	#B'00000001,ccr
+put_rxd_buf_0
+	rts
+
+;- get rxd buffer with check -
+; entry	 none.
+; return cary=1:r0l=data,0:no data
+; break	 r0l,er1
+; stack	 (4) or (4)+28)
+get_rxd_buf_chk:
+;*	mov.b	@rxd_act,r0l
+	mov.b	@startof DEBUG_RAM + x_rxd_act,r0l		;* 99/10/16
+	bne	_get_rxd_buf:8
+;*	jmp	@int_end
+	jmp	@startof DEBUG_RAM + x_int_end			;* 99/10/16
+
+;- get rxd buffer -
+; entry	 none.
+; return cary=1:r0l=data,0:no data
+; break	 r0l,er1
+; stack	 (4)
+get_rxd_buf:
+;*	mov.b	@rxd_act,r0l
+	mov.b	@startof DEBUG_RAM + x_rxd_act,r0l		;* 99/10/16
+	cmp.b	#0,r0l
+	beq	get_rxd_buf_0:8
+_get_rxd_buf
+	sub.l	er1,er1
+;*	mov.b	@rxd_wrp,r1l
+	mov.b	@startof DEBUG_RAM + x_rxd_wrp,r1l		;* 99/10/16
+	sub.b	r0l,r1l
+	dec.b	r0l
+;*	mov.b	r0l,@rxd_act
+	mov.b	r0l,@startof DEBUG_RAM + x_rxd_act		;* 99/10/16
+	and.b	#RXD_BUF_SIZE-1,r1l
+;*	mov.b	@(rxd_buf,er1),r0l
+	mov.b	@(startof DEBUG_RAM + x_rxd_buf,er1),r0l	;* 99/10/16
+	orc	#B'00000001,ccr
+get_rxd_buf_0
+	rts
+
+;- check rxd buffer -
+; entry	 none.
+; return cary=1:data in buffer,0:no data
+; break	 none.
+; stack	 (4)+2
+chk_rxd_buf:
+	push.w	r0
+;*	mov.b	@rxd_act,r0l
+	mov.b	@startof DEBUG_RAM + x_rxd_act,r0l		;* 99/10/16
+	cmp.b	#1,r0l
+	pop.w	r0
+	xorc	#B'00000001,ccr
+	rts
+
+;- put txd buffer -
+; entry	 r0l=data
+; return cary=1:ok,0:buffer full
+; break	 er1
+; stack	 (4)
+put_txd_buf:
+	bld	#7,@SCRx:8	; TIE check
+	bcs	put_txd_buf_0:8	; txd interrupt enable !
+snd_txd:	;<ent> r0l=data <ret> none. <brk> none.
+	bset	#7,@SCRx:8	; TIE set
+	mov.b	r0l,@TDRx:8
+	bclr	#7,@SSRx:8	; TDRE clear
+	orc	#B'00000001,ccr
+	rts
+put_txd_buf_0
+;*	mov.b	@txd_act,r1l
+	mov.b	@startof DEBUG_RAM + x_txd_act,r1l		;* 99/10/16
+	cmp.b	#TXD_BUF_SIZE,r1l
+	bhs	put_txd_buf_1:8
+	inc.b	r1l
+;*	mov.b	r1l,@txd_act
+	mov.b	r1l,@startof DEBUG_RAM + x_txd_act		;* 99/10/16
+	sub.l	er1,er1
+;*	mov.b	@txd_wrp,r1l
+	mov.b	@startof DEBUG_RAM + x_txd_wrp,r1l		;* 99/10/16
+;*	mov.b	r0l,@(txd_buf,er1)
+	mov.b	r0l,@(startof DEBUG_RAM + x_txd_buf,er1)	;* 99/10/16
+	inc.b	r1l
+	and.b	#TXD_BUF_SIZE-1,r1l
+;*	mov.b	r1l,@txd_wrp
+	mov.b	r1l,@startof DEBUG_RAM + x_txd_wrp		;* 99/10/16
+	orc	#B'00000001,ccr
+put_txd_buf_1
+	rts
+
+;- get txd buffer -
+; entry	 none.
+; return cary=1:r0l=data,0:no data
+; break	 r0l,er1
+; stack	 (4)
+get_txd_buf:
+	sub.l	er1,er1
+;*	mov.b	@txd_act,r0l
+	mov.b	@startof DEBUG_RAM + x_txd_act,r0l		;* 99/10/16
+	beq	get_txd_buf_0:8
+;*	mov.b	@txd_wrp,r1l
+	mov.b	@startof DEBUG_RAM + x_txd_wrp,r1l		;* 99/10/16
+	sub.b	r0l,r1l
+	dec.b	r0l
+;*	mov.b	r0l,@txd_act
+	mov.b	r0l,@startof DEBUG_RAM + x_txd_act		;* 99/10/16
+	and.b	#TXD_BUF_SIZE-1,r1l
+;*	mov.b	@(txd_buf,er1),r0l
+	mov.b	@(startof DEBUG_RAM + x_txd_buf,er1),r0l	;* 99/10/16
+	orc	#B'00000001,ccr
+get_txd_buf_0
+	rts
+
+	;//////////////////
+	;/// direct out ///
+	;//////////////////
+
+;- direct put charactor -
+; entry	 r0l = data
+; return zero:cary=0:1 send
+;		   0:0 buffer full
+;		   1:0 monitor active
+; break	 none.
+; stack	 (4)+6+4
+	.export	dbg_putc
+dbg_putc:
+	stc.w	ccr,@-sp
+	orc	#B'11000000,ccr
+	push	er1	;!
+;*	mov.l	@dbg_wke-4,er1
+;**	mov.l	#startof DEBUG_RAM + sizeof DEBUG_RAM -4,er1	;* 99/10/16
+	mov.l	@startof DEBUG_RAM + sizeof DEBUG_RAM -4,er1	;** 00/6/21
+	cmp.l	#debug_entry,er1
+	beq	dbg_putc_0:8
+	pop	er1	;!
+	bclr	#0,@sp
+	bset	#2,@sp
+	bra	dbg_putc_1:8
+dbg_putc_0
+	bsr	put_txd_buf
+	pop	er1	;!
+	bst	#0,@sp
+	bclr	#2,@sp
+dbg_putc_1
+	ldc.w	@sp+,ccr
+	rts
+
+	;/////////////////
+	;/// direct in ///
+	;/////////////////
+
+;- direct get charactor -
+; entry	 none.
+; return zero:cary=0:1 get (r0l=data)
+;		   0:0 buffer empty
+;		   1:0 monitor active
+; break	 r0l
+; stack	 (4)+6+4
+	.export	dbg_getc
+dbg_getc:
+	stc.w	ccr,@-sp
+	orc	#B'11000000,ccr
+	push	er1	;!
+;*	mov.l	@dbg_wke-4,er1
+;**	mov.l	#startof DEBUG_RAM + sizeof DEBUG_RAM -4,er1	;* 99/10/16
+	mov.l	@startof DEBUG_RAM + sizeof DEBUG_RAM -4,er1	;** 00/6/21
+	cmp.l	#debug_entry,er1
+	beq	dbg_getc_0:8
+	pop	er1	;!
+	bclr	#0,@sp
+	bset	#2,@sp
+	bra	dbg_getc_1:8
+dbg_getc_0
+	bsr	get_rxd_buf
+	pop	er1	;!
+	bst	#0,@sp
+	bclr	#2,@sp
+dbg_getc_1
+	ldc.w	@sp+,ccr
+	rts
+
+;-;- direct put charactor hex byte -
+;-; entry	 r0l=data
+;-; return none.
+;-; break	 r0l
+;-; stack	 (4)+6+10
+;-	.export	dbg_putc_hb
+;-dbg_putc_hb:
+;-	push.w	r0
+;-	shlr.b	r0l
+;-	shlr.b	r0l
+;-	shlr.b	r0l
+;-	shlr.b	r0l
+;-	bsr	dbg_putc_hb_0:8
+;-	pop.w	r0
+;-	and.b	#H'f,r0l
+;-dbg_putc_hb_0
+;-	cmp.b	#9,r0l
+;-	bls	dbg_putc_hb_1:8
+;-	add.b	#"A"-"0"-10,r0l
+;-dbg_putc_hb_1
+;-	add.b	#"0",r0l
+;-	bra	dbg_putc
+
+	;//////////////////////
+	;/// input & output ///
+	;//////////////////////
+
+;- put charactor -
+; entry	 r0l=data
+; return none.
+; break	 none.
+; stack	 (4)+6+32
+putc:	;<ent> r0l=data <ret> none. <brk> none.
+	push	er1
+	push.w	r0
+	bsr	put_txd_buf
+	bcs	putc_1:8
+	;* for txd buffer full *
+putc_0
+;*	jsr	@int_end
+	jsr	@startof DEBUG_RAM + x_int_end			;* 99/10/16
+	bcc	putc_0a:8
+	bsr	put_rxd_buf
+	bra	putc_0:8
+putc_0a
+	bsr	get_txd_buf
+	bcc	putc_0b:8
+	bsr	snd_txd
+putc_0b
+	mov.w	@sp,r0
+	bsr	put_txd_buf
+	bcc	putc_0:8		; why !?
+	;* for txd buffer empty *
+putc_1
+;*	jsr	@int_end
+	jsr	@startof DEBUG_RAM + x_int_end			;* 99/10/16
+	bcc	putc_1a:8
+	bsr	put_rxd_buf
+	bra	putc_1:8
+putc_1a
+	bsr	get_txd_buf
+	bcc	putc_1b:8
+	bsr	snd_txd
+	bra	putc_1:8
+putc_1b
+	bclr	#7,@SCRx:8		; txd interrupt disable
+	pop.w	r0
+	pop	er1
+	rts
+
+;- put charactor "-" -
+; entry	 none.
+; retrun none.
+; break	 r0l
+; stack	 (4)+38
+putc_m:
+	mov.b	#"-",r0l
+	bra	putc
+
+;- put charactor BS -
+; entry	 none.
+; retrun none.
+; break	 r0l
+; stack	 (4)+38
+putc_bs:
+	mov.b	#H'08,r0l
+	bra	putc
+
+;- put charactor SP -
+; entry	 none.
+; retrun none.
+; break	 r0l
+; stack	 (4)+38
+putc_sp:
+	mov.b	#" ",r0l
+	bra	putc
+
+;- put charctor SP n -
+; entry	 r0l=n
+; return none.
+; break	 r0
+; stack (4)+42
+putc_sp_n
+	mov.b	r0l,r0h
+	beq	putc_sp_n_1:8
+putc_sp_n_0
+	bsr	putc_sp
+	dec.b	r0h
+	bne	putc_sp_n_0:8
+putc_sp_n_1
+	rts
+
+;- put charactor CR LF -
+; entry	 none.
+; return none.
+; break	 r0l
+; stack	 (4)+42
+putc_crlf:
+	mov.b	#H'0d,r0l
+	bsr	putc
+	mov.b	#H'0a,r0l
+	bra	putc
+
+;- put charactor hex byte -
+; entry	 r0l=data
+; return none.
+; break	 r0l
+; stack	 (4)+6+38
+putc_hb:
+	push.w	r0
+	shlr.b	r0l
+	shlr.b	r0l
+	shlr.b	r0l
+	shlr.b	r0l
+	bsr	putc_hb_0:8
+	pop.w	r0
+	and.b	#H'f,r0l
+putc_hb_0
+	cmp.b	#9,r0l
+	bls	putc_hb_1:8
+	add.b	#"A"-"0"-10,r0l
+putc_hb_1
+	add.b	#"0",r0l
+	bra	putc
+
+;- put charactor hex word -
+; entry	 r0=data
+; return none.
+; break	 r0
+; stack	 (4)+48
+putc_hw:
+	xor.b	r0l,r0h
+	xor.b	r0h,r0l
+	xor.b	r0l,r0h
+	bsr	putc_hb
+	xor.b	r0l,r0h
+	xor.b	r0h,r0l
+	xor.b	r0l,r0h
+	bra	putc_hb
+
+;- put charactor hex long -
+; entry	 er0=data
+; return none.
+; break	 er0
+; stack	 (4)+52
+putc_hl:
+	xor.w	e0,r0
+	xor.w	r0,e0
+	xor.w	e0,r0
+	bsr	putc_hw
+	xor.w	e0,r0
+	xor.w	r0,e0
+	xor.w	e0,r0
+	bra	putc_hw
+
+;- put charactor hex address -
+; entry	 e0l:r0h:r0l=24 bit's address
+; return none.
+; break	 er0
+; stack	 (4)+52
+putc_ha:
+	xor.w	e0,r0
+	xor.w	r0,e0
+	xor.w	e0,r0
+	bsr	putc_hb
+	xor.w	e0,r0
+	xor.w	r0,e0
+	xor.w	e0,r0
+	bra	putc_hw
+
+;- put string's -
+; entry	 er1=string's data address top (null end)
+; return er1=null+1 address
+; break	 r0l,er1
+; stack	 (4)+42
+puts:
+	mov.b	@er1+,r0l
+	beq	puts_0:8
+	bsr	putc
+	bra	puts:8
+puts_0
+	rts
+
+;- puts string's hex byte -
+; entry	 r0l=count
+;	 er1=data address
+; break	 r0,er1
+; stack	 (4)+2+46
+puts_hb_n:
+	mov.b	r0l,r0h
+	beq	puts_hb_n_1:8
+puts_hb_n_0
+	mov.b	@er1+,r0l
+	bsr	putc_hb
+	dec.b	r0h
+	bne	puts_hb_n_0:8
+puts_hb_n_1
+	rts
+
+;- get charactor -
+; entry	 none.
+; return r0l=data
+; break	 r0l
+; stack	 (4)+4+32
+getc:	;<ent> none. <ret> r0l=data <brk> r0l
+	push	er1
+getc_0
+	bsr	get_rxd_buf_chk
+	bcs	getc_2:8
+	bsr	get_txd_buf
+	bcc	getc_1:8
+	bsr	snd_txd
+	bra	getc_0:8
+getc_1
+	bclr	#7,@SCRx:8		; txd interrupt disable
+	bra	getc_0:8
+getc_2
+	pop	er1
+	rts
+
+;- get charactor with echo -
+; entry	 none.
+; return r0l=data
+; break	 r0l
+; stack	 (4)+42
+getche:
+	bsr	getc
+	bsr	putc
+	cmp.b	#H'0d,r0l
+	bne	getche_0:8
+	mov.b	#H'0a,r0l
+	bsr	putc
+	mov.b	#H'0d,r0l
+getche_0
+	rts
+
+;- get charactor with echo hex charactor to binary -
+; entry	 none.
+; return cary=1:r0l=0..f,0:r0l=get charactor
+; break	 r0l
+; stack	 (4)+46
+getche_hc2b:
+	bsr	getche
+	cmp.b	#"0",r0l
+	blo	getche_hc2b_0:8
+	cmp.b	#"9",r0l
+	bls	getche_hc2b_3:8
+	cmp.b	#"A",r0l
+	blo	getche_hc2b_0:8
+	cmp.b	#"F",r0l
+	bls	getche_hc2b_2:8
+	cmp.b	#"a",r0l
+	blo	getche_hc2b_0:8
+	cmp.b	#"f",r0l
+	bls	getche_hc2b_1:8
+getche_hc2b_0
+	andc	#B'11111110,ccr
+	rts
+getche_hc2b_1
+	add.b	#-("a"-"A"),r0l
+getche_hc2b_2
+	add.b	#-("A"-"0"-10),r0l
+getche_hc2b_3
+	add.b	#-"0",r0l
+	rts
+
+;- get charactor with echo hex n charactor's to binary -
+; entry	 r0l=n(1..8)
+; return er1=value
+;	 r0h=input value count
+;	 cary=1:get end,0:get not hex charactor(r0l=charctor,r0h==0 ? no value)
+; break	 er0,er1
+; stack	 (4)+50
+getche_hc2b_n:
+	sub.l	er1,er1
+	extu.w	r0	; r0h=0
+	mov.w	r0,e0
+	beq	getche_hc2b_n_2:8
+	bsr	getche_hc2b
+	bcs	getche_hc2b_n_1:8
+	xor.w	e0,e0
+	bra	getche_hc2b_n_3:8
+getche_hc2b_n_0
+	bsr	getche_hc2b
+	bcc	getche_hc2b_n_3:8
+getche_hc2b_n_1
+	shll.l	er1
+	shll.l	er1
+	shll.l	er1
+	shll.l	er1
+	or.b	r0l,r1l
+	inc.b	r0h						;+ 98/7/12
+	dec.w	#1,e0
+	bne	getche_hc2b_n_0:8
+getche_hc2b_n_2
+	orc	#B'00000001,ccr
+getche_hc2b_n_3
+	rts
+
+;- get value with echo -
+; entry	 none.
+; return r0l=data
+; break	 r0l
+; stack	 (4)+42
+getval:
+	bsr	getc
+	cmp.b	#H'0d,r0l
+	beq	getche_0:8
+	bsr	putc
+getval_0
+	rts
+
+;- get value with echo hex charactor to binary -
+; entry	 none.
+; return cary=1:r0l=0..f,0:r0l=get charactor
+; break	 r0l
+; stack	 (4)+46
+getval_hc2b:
+	bsr	getval
+	cmp.b	#"0",r0l
+	blo	getval_hc2b_0:8
+	cmp.b	#"9",r0l
+	bls	getval_hc2b_3:8
+	cmp.b	#"A",r0l
+	blo	getval_hc2b_0:8
+	cmp.b	#"F",r0l
+	bls	getval_hc2b_2:8
+	cmp.b	#"a",r0l
+	blo	getval_hc2b_0:8
+	cmp.b	#"f",r0l
+	bls	getval_hc2b_1:8
+getval_hc2b_0
+	andc	#B'11111110,ccr
+	rts
+getval_hc2b_1
+	add.b	#-("a"-"A"),r0l
+getval_hc2b_2
+	add.b	#-("A"-"0"-10),r0l
+getval_hc2b_3
+	add.b	#-"0",r0l
+	rts
+
+;- get value with echo hex n charactor's to binary -
+; entry	 r0l=n(1..8)
+; return er1=value
+;	 r0h=input value count
+;	 cary=1:get end,0:get not hex charactor(r0l=charctor,r0h==0 ? no value)
+; break	 er0,er1
+; stack	 (4)+50
+getval_hc2b_n:
+	sub.l	er1,er1
+	extu.w	r0	; r0h=0
+	mov.w	r0,e0
+	beq	getval_hc2b_n_2:8
+	bsr	getval_hc2b
+	bcs	getval_hc2b_n_1:8
+	xor.w	e0,e0
+	bra	getval_hc2b_n_3:8
+getval_hc2b_n_0
+	bsr	getval_hc2b
+	bcc	getval_hc2b_n_3:8
+getval_hc2b_n_1
+	shll.l	er1
+	shll.l	er1
+	shll.l	er1
+	shll.l	er1
+	or.b	r0l,r1l
+	inc.b	r0h						;+ 98/7/12
+	dec.w	#1,e0
+	bne	getval_hc2b_n_0:8
+getval_hc2b_n_2
+	orc	#B'00000001,ccr
+getval_hc2b_n_3
+	rts
+
+	;///////////////
+	;/// debuger ///
+	;///////////////
+
+debug_entry_txd_chk
+	bsr	get_txd_buf
+	bcc	debug_entry_txd_nul:8
+	bsr	snd_txd
+	bra	debug_entry_end:8
+debug_entry_txd_nul
+	bclr	#7,@SCRx:8		; txd interrupt disable
+debug_entry_end
+;*	bsr	get_rxd_buf_chk
+;**	jsr	@int_end					;* 98/8/15
+	jsr	@startof DEBUG_RAM + x_int_end			;** 99/10/16
+debug_entry:
+	bcc	debug_entry_txd_chk:8	; txd interrupt !
+	cmp.b	#"@",r0l
+;*	bne	debug_entry_end:8
+	beq	debug_entry_00:8				;* 98/8/15
+	bsr	put_rxd_buf					;+ 98/8/15 ..
+	bra	debug_entry_end:8
+debug_entry_00
+	mov.b	#0,r0h
+;*	mov.b	r0h,@rxd_act					;.. + 98/8/15
+	mov.b	r0h,@startof DEBUG_RAM + x_rxd_act		;* 99/10/16
+	;* message *
+	mov.l	#debug_entry_msg,er1
+debug_entry_0
+	bsr	puts
+	;* prompt *
+debug_prompt
+;*	mov.l	@int_end,er1
+	mov.l	@startof DEBUG_RAM + x_int_end,er1		;* 99/10/16
+	and.w	#H'ff,e1
+	cmp.l	#int_end_dbg,er1
+	beq	debug_prompt_0:8
+	;* debugging mode *
+	mov.l	#debug_prompt2_msg,er1
+	bsr	puts
+	mov.l	#debug_command2_top,er1
+	bra	debug_decode:8
+	;* monitor mode *
+debug_prompt_0
+	mov.l	#debug_prompt_msg,er1
+	bsr	puts
+	mov.l	#debug_command_top,er1
+	;* decode *
+debug_decode
+	bsr	getche
+debug_decode_0
+	mov.b	@er1,r0h
+	beq	debug_decode_1:8	; unknown !
+	cmp.b	r0l,r0h
+	beq	debug_decode_3:8	; much !
+	bclr	#7,r0h
+	cmp.b	r0l,r0h
+	beq	debug_decode_2:8	; next much !
+	adds	#4,er1
+	bra	debug_decode_0:8
+	;* ? *
+debug_decode_1
+	mov.l	#debug_unknown_msg,er1
+	bra	debug_entry_0
+	;* next decode *
+debug_decode_2
+	mov.l	@er1,er1
+	and.w	#H'ff,e1
+	bra	debug_decode:8
+	;* go *
+debug_decode_3
+	mov.l	@er1,er1
+	and.w	#H'ff,e1
+	jsr	@er1
+	bcc	debug_decode_1:8	; command error ! (disp "?")
+	bra	debug_prompt:8
+
+debug_decode_next:
+	adds	#4,sp		; return skip
+	bra	debug_decode:8
+
+debug_command_top:
+	.data.l	("_"+H'80)*256*65536+debug_command__		;+ 99/10/17
+	.data.l	"@"*256*65536+debug_exit
+	.data.l	("C"+H'80)*256*65536+debug_command_C
+	.data.l	("D"+H'80)*256*65536+debug_command_D
+	.data.l	("I"+H'80)*256*65536+debug_command_I
+	.data.l	("?"+H'80)*256*65536+debug_command_Q
+	.data.l	"R"*256*65536+wreset
+	.data.l	("S"+H'80)*256*65536+debug_command_S		;+ 99/10/16
+	.data.l	"U"*256*65536+usr_fnc				;+ 99/10/16
+	.data.l	("W"+H'80)*256*65536+debug_command_W
+	.data.b	0	; end
+	.align	2
+
+debug_command__							;+ 99/10/17 ..
+	.data.l	("S"+H'80)*256*65536+debug_command__S
+	.data.b	0	; end
+	.align	2
+
+debug_command__S
+	.data.l	("U"+H'80)*256*65536+debug_command__SU
+	.data.b	0	; end
+	.align	2
+
+debug_command__SU
+	.data.l	H'0d*256*65536+clr_usr
+	.data.b	0	; end
+	.align	2						;.. + 99/10/17
+
+debug_command_C
+	.data.l	"M"*256*65536+chn_mem
+	.data.l	"S"*256*65536+chn_msz
+	.data.b	0	; end
+	.align	2
+
+debug_command_D
+	.data.l	"A"*256*65536+dis_asm
+	.data.l	"M"*256*65536+dmp_mem
+	.data.l	("I"+H'80)*256*65536+debug_command_DI
+	.data.l	"S"*256*65536+dmp_siz
+	.data.l	"W"*256*65536+dmp_wch
+	.data.b	0	; end
+	.align	2
+
+debug_command_DI
+	.data.l	H'0d*256*65536+dbg_sta
+	.data.b	0	; end
+	.align	2
+
+debug_command_I
+	.data.l	"M"*256*65536+ini_mem
+	.data.b	0	; end
+	.align	2
+
+debug_command_Q
+	.data.l	H'0d*256*65536+hlp_msg
+	.data.l	("S"+H'80)*256*65536+debug_command_QS		;+ 99/10/17
+	.data.b	0	; end
+	.align	2
+
+debug_command_QS						;+ 99/10/17 ..
+	.data.l	("U"+H'80)*256*65536+debug_command_QSU
+	.data.b	0	; end
+	.align	2
+
+debug_command_QSU
+	.data.l	H'0d*256*65536+dsp_usr
+	.data.b	0	; end
+	.align	2						;.. + 99/10/17
+
+debug_command_S							;+ 99/10/16 ..
+	.data.l	"U"*256*65536+set_usr
+	.align	2						;.. + 99/10/16
+
+debug_command_W
+	.data.l	"S"*256*65536+wch_siz
+	.data.b	0	; end
+	.align	2
+
+debug_command2_top:
+	.data.l	("_"+H'80)*256*65536+debug_command2__
+	.data.l	("C"+H'80)*256*65536+debug_command2_C
+	.data.l	("D"+H'80)*256*65536+debug_command2_D
+	.data.l	("G"+H'80)*256*65536+debug_command2_G
+	.data.l	("I"+H'80)*256*65536+debug_command2_I
+	.data.l	("P"+H'80)*256*65536+debug_command2_P
+	.data.l	("?"+H'80)*256*65536+debug_command2_Q
+	.data.l	"R"*256*65536+wreset
+	.data.l	("S"+H'80)*256*65536+debug_command2_S
+	.data.l	("T"+H'80)*256*65536+debug_command2_T
+	.data.l	"U"*256*65536+usr_fnc				;+ 99/10/16
+	.data.l	("V"+H'80)*256*65536+debug_command2_V		;+ 00/5/27
+	.data.b	0	; end
+	.align	2
+
+debug_command2__
+	.data.l	("P"+H'80)*256*65536+debug_command2__P
+	.data.l	("S"+H'80)*256*65536+debug_command__S	; íçà”	;+ 99/10/17
+	.data.b	0	; end
+	.align	2
+
+debug_command2__P
+	.data.l	("B"+H'80)*256*65536+debug_command2__PB
+	.data.b	0	; end
+	.align	2
+
+debug_command2__PB
+	.data.l	H'0d*256*65536+pcb_clr
+	.data.b	0	; end
+	.align	2
+
+debug_command2_C
+	.data.l	"M"*256*65536+chn_mem
+	.data.l	"R"*256*65536+chn_reg
+	.data.l	"S"*256*65536+chn_msz
+	.data.b	0	; end
+	.align	2
+
+debug_command2_D
+	.data.l	"A"*256*65536+dis_asm
+	.data.l	"M"*256*65536+dmp_mem
+	.data.l	("I"+H'80)*256*65536+debug_command2_DI
+	.data.l	("O"+H'80)*256*65536+debug_command2_DO
+	.data.l	("R"+H'80)*256*65536+debug_command2_DR
+	.data.l	"S"*256*65536+dmp_siz
+	.data.b	0	; end
+	.align	2
+
+debug_command2_DI
+	.data.l	H'0d*256*65536+dmp_ipr
+	.data.b	0	; end
+	.align	2
+
+debug_command2_DO
+	.data.l	H'0d*256*65536+dbg_stp
+	.data.b	0	; end
+	.align	2
+
+debug_command2_DR
+	.data.l	H'0d*256*65536+dmp_reg
+	.data.b	0	; end
+	.align	2
+
+debug_command2_G
+	.data.l	H'0d*256*65536+go
+	.data.b	0	; end
+	.align	2
+
+debug_command2_I
+	.data.l	"M"*256*65536+ini_mem
+	.data.b	0	; end
+	.align	2
+
+debug_command2_P
+	.data.l	"B"*256*65536+pcb_set
+	.data.b	0	; end
+	.align	2
+
+debug_command2_Q
+	.data.l	H'0d*256*65536+hlp_msg2
+	.data.l	("P"+H'80)*256*65536+debug_command2_QP
+	.data.l	("S"+H'80)*256*65536+debug_command_QS	; íçà”	; 99/10/17
+	.data.b	0	; end
+	.align	2
+
+debug_command2_QP
+	.data.l	("B"+H'80)*256*65536+debug_command2_QPB
+	.data.b	0	; end
+	.align	2
+
+debug_command2_QPB
+	.data.l	H'0d*256*65536+pcb_dsp
+	.data.b	0	; end
+	.align	2
+
+debug_command2_S
+	.data.l	H'0d*256*65536+one_step
+	.data.l	"T"*256*65536+step
+	.data.l	"U"*256*65536+set_usr				;+ 99/10/16
+	.data.b	0	; end
+	.align	2
+
+debug_command2_T
+	.data.l	H'0d*256*65536+one_trace
+	.data.l	"R"*256*65536+trace
+	.data.b	0	; end
+	.align	2
+
+debug_command2_V						;+ 00/5/27 ..
+	.data.l	"L"*256*65536+vew_lst
+	.data.l	"S"*256*65536+vew_stp
+	.data.l	"T"*256*65536+vew_trc
+	.data.b	0	; end
+	.align	2						;.. + 00/5/27
+
+	;**************
+	;* debug exit *
+	;**************
+
+debug_exit:
+	mov.l	#debug_entry_end,er1
+	mov.l	er1,@sp			; return to exit !
+	mov.l	#debug_exit_msg,er1
+	bra	puts
+
+	;*************
+	;* command's *
+	;*************
+
+	.include "debuger\dmpmem.inc"
+	.include "debuger\inimem.inc"
+	.include "debuger\chnmem.inc"
+	.include "debuger\disasm.inc"
+	.include "debuger\dbgmod.inc"
+	.include "debuger\dmpwch.inc"
+	.include "debuger\dmpsiz.inc"
+	.include "debuger\wchsiz.inc"
+	.include "debuger\hlpmsg.inc"
+	.include "debuger\wreset.inc"
+	.include "debuger\chnmsz.inc"
+	.include "debuger\usrfnc.inc"				;+ 99/10/16
+
+;- format scan -
+; entry	 er1=format strings
+; return cary=1:ok(set regs),0:ng
+; break	 all
+; stack	 (4)+12+54
+fscan:
+	sub.l	er6,er6
+	sub.l	er5,er5
+	sub.l	er4,er4
+	sub.l	er3,er3
+	sub.l	er2,er2
+	push	er2	; er1
+	push	er2	; er0
+fscan_0
+	mov.b	@er1+,r0h
+	beq	fscan_ok:8
+	bsr	fscan_sub
+	beq	fscan_err:8	; format error !
+	bcc	fscan_1:8
+	cmp.b	#"x",r0h
+	bne	fscan_err:8	; format error !
+	;* %nx *
+	mov.l	er5,er6
+	mov.l	er4,er5
+	mov.l	er3,er4
+	mov.l	er2,er3
+	mov.l	@sp,er2
+	push	er1
+	mov.l	@(4+4,sp),er1
+	mov.l	er1,@(4,sp)
+	bsr	getche_hc2b_n
+	mov.l	er1,@(4+4,sp)
+	pop	er1
+	bcs	fscan_0:8
+;*	mov.w	e0,e0
+	cmp.b	#0,r0h						;* 98/7/12
+	beq	fscan_err:8	; no value !
+	mov.b	@er1+,r0h
+	beq	fscan_err:8	; format error !
+	bsr	fscan_sub
+	bls	fscan_err:8	; format error !
+	bra	fscan_2:8
+fscan_1
+	bsr	getche
+fscan_2
+	cmp.b	r0h,r0l
+	beq	fscan_0:8
+fscan_err
+	pop	er1
+	pop	er0
+	andc	#B'11111110,ccr
+	rts
+fscan_ok
+	pop	er1
+	pop	er0
+	orc	#B'00000001,ccr
+	rts
+fscan_sub
+	cmp.b	#"\",r0h
+	bne	fscan_sub_0:8
+	;* \? *
+	mov.b	@er1+,r0h
+	beq	fscan_sub_2:8	; format error !
+	cmp.b	#"\",r0h
+	beq	fscan_sub_3:8	; "\\" !
+	cmp.b	#"r",r0h
+	bne	fscan_sub_2:8	; unknown format !
+	mov.b	#H'0d,r0h
+	bra	fscan_sub_3:8	; "\r" !
+fscan_sub_0
+	cmp.b	#"%",r0h
+	bne	fscan_sub_3:8
+	;* %? *
+	mov.b	@er1+,r0h
+	beq	fscan_sub_2:8	; format error !
+	cmp.b	#"%",r0h
+	beq	fscan_sub_3:8	; "%%" !
+	mov.b	#8,r0l
+	cmp.b	#"x",r0h
+	beq	fscan_sub_1:8	; "%x" !
+	cmp.b	#"0",r0h
+	blo	fscan_sub_2:8	; unknown format !
+	cmp.b	#"9",r0h
+	bhs	fscan_sub_2:8	; unknown format !
+	add.b	#-"0",r0h
+	mov.b	r0h,r0l
+	mov.b	@er1+,r0h
+	beq	fscan_sub_3:8	; format error !
+	;* %nx *
+fscan_sub_1
+	orc	#B'00000001,ccr
+	bra	fscan_sub_4:8
+fscan_sub_2
+	mov.b	#0,r0h
+fscan_sub_3
+	andc	#B'11111110,ccr
+fscan_sub_4
+	mov.b	r0h,r0h
+	rts
+
+;- to upper -
+; entry	 r0l=charactor code
+; return r0l=charactor code
+; break	 r0l
+; stack	 (4)+12+54
+toupper:
+	cmp.b	#"a",r0l
+	blo	toupper_0:8
+	cmp.b	#"z",r0l
+	bhi	toupper_0:8
+	add.b	#-("a"-"A"),r0l
+toupper_0
+	rts
+
+debug_entry_msg
+ .sdata  <H'0d><H'0a>
+_debug_entry_msg
+ .sdataz "*** DEBUGER for H8/300H Ver.0.62b Copyright (C) 1998-2000 by AKIYA ***"
+debug_exit_msg
+ .sdata  <H'0d><H'0a>
+ .sdataz "*** Exit ***"<H'0d><H'0a>
+debug_prompt_msg
+ .sdataz <H'0d><H'0a>"*"
+debug_prompt2_msg
+ .sdataz <H'0d><H'0a>">"
+debug_unknown_msg
+ .sdataz <H'0d><H'0a>"?"
+	.align	2
+
+	.end
+
